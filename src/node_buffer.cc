@@ -45,13 +45,13 @@
     if (!(r)) return node::THROW_ERR_INDEX_OUT_OF_RANGE(env);               \
   } while (0)
 
-#define SLICE_START_END(start_arg, end_arg, end_max)                        \
-  size_t start;                                                             \
-  size_t end;                                                               \
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(start_arg, 0, &start));           \
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(end_arg, end_max, &end));         \
-  if (end < start) end = start;                                             \
-  THROW_AND_RETURN_IF_OOB(end <= end_max);                                  \
+#define SLICE_START_END(context, start_arg, end_arg, end_max)                  \
+  size_t start;                                                                \
+  size_t end;                                                                  \
+  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(context, start_arg, 0, &start));     \
+  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(context, end_arg, end_max, &end));   \
+  if (end < start) end = start;                                                \
+  THROW_AND_RETURN_IF_OOB(end <= end_max);                                     \
   size_t length = end - start;
 
 namespace node {
@@ -165,7 +165,8 @@ void CallbackInfo::WeakCallback(Isolate* isolate) {
 
 
 // Parse index for external array data.
-inline MUST_USE_RESULT bool ParseArrayIndex(Local<Value> arg,
+inline MUST_USE_RESULT bool ParseArrayIndex(Local<Context> context,
+                                            Local<Value> arg,
                                             size_t def,
                                             size_t* ret) {
   if (arg->IsUndefined()) {
@@ -173,7 +174,7 @@ inline MUST_USE_RESULT bool ParseArrayIndex(Local<Value> arg,
     return true;
   }
 
-  int64_t tmp_i = arg->IntegerValue();
+  int64_t tmp_i = arg->IntegerValue(context).FromJust();
 
   if (tmp_i < 0)
     return false;
@@ -449,7 +450,7 @@ void StringSlice(const FunctionCallbackInfo<Value>& args) {
   if (ts_obj_length == 0)
     return args.GetReturnValue().SetEmptyString();
 
-  SLICE_START_END(args[0], args[1], ts_obj_length)
+  SLICE_START_END(env->context(), args[0], args[1], ts_obj_length)
 
   Local<Value> error;
   MaybeLocal<Value> ret =
@@ -461,6 +462,61 @@ void StringSlice(const FunctionCallbackInfo<Value>& args) {
   if (ret.IsEmpty()) {
     CHECK(!error.IsEmpty());
     isolate->ThrowException(error);
+    return;
+  }
+  args.GetReturnValue().Set(ret.ToLocalChecked());
+}
+
+
+template <>
+void StringSlice<UCS2>(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+
+  THROW_AND_RETURN_UNLESS_BUFFER(env, args.This());
+  SPREAD_BUFFER_ARG(args.This(), ts_obj);
+
+  if (ts_obj_length == 0)
+    return args.GetReturnValue().SetEmptyString();
+
+  SLICE_START_END(env->context(), args[0], args[1], ts_obj_length)
+  length /= 2;
+
+  const char* data = ts_obj_data + start;
+  const uint16_t* buf;
+  bool release = false;
+
+  // Node's "ucs2" encoding expects LE character data inside a Buffer, so we
+  // need to reorder on BE platforms.  See https://nodejs.org/api/buffer.html
+  // regarding Node's "ucs2" encoding specification.
+  const bool aligned = (reinterpret_cast<uintptr_t>(data) % sizeof(*buf) == 0);
+  if (IsLittleEndian() && !aligned) {
+    // Make a copy to avoid unaligned accesses in v8::String::NewFromTwoByte().
+    // This applies ONLY to little endian platforms, as misalignment will be
+    // handled by a byte-swapping operation in StringBytes::Encode on
+    // big endian platforms.
+    uint16_t* copy = new uint16_t[length];
+    for (size_t i = 0, k = 0; i < length; i += 1, k += 2) {
+      // Assumes that the input is little endian.
+      const uint8_t lo = static_cast<uint8_t>(data[k + 0]);
+      const uint8_t hi = static_cast<uint8_t>(data[k + 1]);
+      copy[i] = lo | hi << 8;
+    }
+    buf = copy;
+    release = true;
+  } else {
+    buf = reinterpret_cast<const uint16_t*>(data);
+  }
+
+  Local<Value> error;
+  MaybeLocal<Value> ret =
+      StringBytes::Encode(env->isolate(), buf, length, &error);
+
+  if (release)
+    delete[] buf;
+
+  if (ret.IsEmpty()) {
+    CHECK(!error.IsEmpty());
+    env->isolate()->ThrowException(error);
     return;
   }
   args.GetReturnValue().Set(ret.ToLocalChecked());
@@ -482,9 +538,12 @@ void Copy(const FunctionCallbackInfo<Value> &args) {
   size_t source_start;
   size_t source_end;
 
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(args[2], 0, &target_start));
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(args[3], 0, &source_start));
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(args[4], ts_obj_length, &source_end));
+  THROW_AND_RETURN_IF_OOB(
+      ParseArrayIndex(env->context(), args[2], 0, &target_start));
+  THROW_AND_RETURN_IF_OOB(
+      ParseArrayIndex(env->context(), args[3], 0, &source_start));
+  THROW_AND_RETURN_IF_OOB(
+      ParseArrayIndex(env->context(), args[4], ts_obj_length, &source_end));
 
   // Copy 0 bytes; we're done
   if (target_start >= target_length || source_start >= source_end)
@@ -614,14 +673,14 @@ void StringWrite(const FunctionCallbackInfo<Value>& args) {
   size_t offset;
   size_t max_length;
 
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(args[1], 0, &offset));
+  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(env->context(), args[1], 0, &offset));
   if (offset > ts_obj_length) {
     return node::THROW_ERR_BUFFER_OUT_OF_BOUNDS(
         env, "\"offset\" is outside of buffer bounds");
   }
 
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(args[2], ts_obj_length - offset,
-                                          &max_length));
+  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(
+      env->context(), args[2], ts_obj_length - offset, &max_length));
 
   max_length = MIN(ts_obj_length - offset, max_length);
 
@@ -675,10 +734,14 @@ void CompareOffset(const FunctionCallbackInfo<Value> &args) {
   size_t source_end;
   size_t target_end;
 
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(args[2], 0, &target_start));
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(args[3], 0, &source_start));
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(args[4], target_length, &target_end));
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(args[5], ts_obj_length, &source_end));
+  THROW_AND_RETURN_IF_OOB(
+      ParseArrayIndex(env->context(), args[2], 0, &target_start));
+  THROW_AND_RETURN_IF_OOB(
+      ParseArrayIndex(env->context(), args[3], 0, &source_start));
+  THROW_AND_RETURN_IF_OOB(
+      ParseArrayIndex(env->context(), args[4], target_length, &target_end));
+  THROW_AND_RETURN_IF_OOB(
+      ParseArrayIndex(env->context(), args[5], ts_obj_length, &source_end));
 
   if (source_start > ts_obj_length)
     return node::THROW_ERR_INDEX_OUT_OF_RANGE(env);
@@ -769,7 +832,7 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
   SPREAD_BUFFER_ARG(args[0], ts_obj);
 
   Local<String> needle = args[1].As<String>();
-  int64_t offset_i64 = args[2]->IntegerValue();
+  int64_t offset_i64 = args[2]->IntegerValue(env->context()).FromJust();
   bool is_forward = args[4]->IsTrue();
 
   const char* haystack = ts_obj_data;
@@ -873,19 +936,18 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
 }
 
 void IndexOfBuffer(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
   CHECK(args[1]->IsObject());
   CHECK(args[2]->IsNumber());
   CHECK(args[4]->IsBoolean());
 
-  enum encoding enc = ParseEncoding(args.GetIsolate(),
-                                    args[3],
-                                    UTF8);
+  enum encoding enc = ParseEncoding(env->isolate(), args[3], UTF8);
 
-  THROW_AND_RETURN_UNLESS_BUFFER(Environment::GetCurrent(args), args[0]);
-  THROW_AND_RETURN_UNLESS_BUFFER(Environment::GetCurrent(args), args[1]);
+  THROW_AND_RETURN_UNLESS_BUFFER(env, args[0]);
+  THROW_AND_RETURN_UNLESS_BUFFER(env, args[1]);
   SPREAD_BUFFER_ARG(args[0], ts_obj);
   SPREAD_BUFFER_ARG(args[1], buf);
-  int64_t offset_i64 = args[2]->IntegerValue();
+  int64_t offset_i64 = args[2]->IntegerValue(env->context()).FromJust();
   bool is_forward = args[4]->IsTrue();
 
   const char* haystack = ts_obj_data;
@@ -955,7 +1017,7 @@ void IndexOfNumber(const FunctionCallbackInfo<Value>& args) {
   SPREAD_BUFFER_ARG(args[0], ts_obj);
 
   uint32_t needle = args[1].As<Uint32>()->Value();
-  int64_t offset_i64 = args[2]->IntegerValue();
+  int64_t offset_i64 = args[2].As<Integer>()->Value();
   bool is_forward = args[3]->IsTrue();
 
   int64_t opt_offset = IndexOfOffset(ts_obj_length, offset_i64, 1, is_forward);
